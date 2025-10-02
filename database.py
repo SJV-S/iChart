@@ -24,11 +24,11 @@ class SQLiteDatabase:
     # SINGLE SOURCE OF TRUTH FOR ALL SCHEMAS
     SCHEMA_DEFINITIONS = {
         'series': {  # TABLE_DATA_POINTS
+            'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
             'chart_id': 'TEXT',
             'date': 'TEXT',
             'sys_col': 'TEXT',
-            'value': 'REAL',
-            '_primary_key': '(chart_id, date, sys_col)'
+            'value': 'REAL'
         },
         'chart': {  # TABLE_CHART_METADATA
             'chart_id': 'TEXT PRIMARY KEY',
@@ -81,7 +81,7 @@ class SQLiteDatabase:
             self.cursor = self.connection.cursor()
             self.initialized = True
             self._create_tables()
-            self._ensure_new_columns()
+            self._migrate_schema()
             
             # Count total charts after database connection
             try:
@@ -136,67 +136,66 @@ class SQLiteDatabase:
         sql += "\n)"
         return sql
 
-    def _ensure_new_columns(self):
-        """Dynamically ensure all tables match schema definitions."""
-        user_name = self._get_current_user_name()
-        
-        # Count charts before schema updates
+    def _migrate_schema(self):
+        """Simple migration: if old schema detected, backup data, drop and recreate tables with data."""
         try:
-            self.cursor.execute(f"SELECT COUNT(*) FROM {self.TABLE_CHART_METADATA}")
-            charts_before = self.cursor.fetchone()[0]
-            debug_print(f"_ensure_new_columns() - charts before schema update: {charts_before}")
-        except sqlite3.Error:
-            charts_before = 0
+            self.cursor.execute(f"PRAGMA table_info({self.TABLE_DATA_POINTS})")
+            columns = {row[1]: row[5] for row in self.cursor.fetchall()}
 
-        for table_name, expected_schema in self.SCHEMA_DEFINITIONS.items():
-            # Get current table columns
-            current_columns = self._get_current_table_columns(table_name)
+            # If 'id' column doesn't exist, need to migrate
+            if 'id' not in columns:
+                debug_print(f"_migrate_schema() - old schema detected, migrating to new schema")
 
-            # Find missing columns
-            missing_columns = []
-            for col_name, col_def in expected_schema.items():
-                if col_name.startswith('_'):
-                    continue
-                if col_name not in current_columns:
-                    missing_columns.append((col_name, col_def))
+                # Backup all data
+                self.cursor.execute(f"SELECT chart_id, date, sys_col, value FROM {self.TABLE_DATA_POINTS}")
+                data_backup = self.cursor.fetchall()
 
-            # Add missing columns
-            for col_name, col_def in missing_columns:
-                try:
-                    self.cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_def}")
-                except sqlite3.OperationalError:
-                    pass  # Column already exists
+                self.cursor.execute(f"SELECT * FROM {self.TABLE_CHART_METADATA}")
+                metadata_backup = self.cursor.fetchall()
 
-            # Set default values for new columns
-            if table_name in self.COLUMN_DEFAULTS:
-                for col_name, default_value in self.COLUMN_DEFAULTS[table_name].items():
-                    if col_name in [col[0] for col in missing_columns]:
-                        if default_value is None and col_name == 'owner':
-                            default_value = user_name
+                # Get column names for metadata
+                self.cursor.execute(f"PRAGMA table_info({self.TABLE_CHART_METADATA})")
+                metadata_cols = [row[1] for row in self.cursor.fetchall()]
 
+                # Drop old tables
+                self.cursor.execute(f"DROP TABLE IF EXISTS {self.TABLE_DATA_POINTS}")
+                self.cursor.execute(f"DROP TABLE IF EXISTS {self.TABLE_CHART_METADATA}")
+                self.cursor.execute(f"DROP TABLE IF EXISTS {self.TABLE_CHART_SYNC}")
+                self.cursor.execute(f"DROP TABLE IF EXISTS {self.TABLE_TOMBSTONES}")
+
+                # Recreate tables with new schema
+                for table_name in self.SCHEMA_DEFINITIONS:
+                    sql = self._get_create_table_sql(table_name)
+                    self.cursor.execute(sql)
+
+                # Restore data
+                if data_backup:
+                    self.cursor.executemany(
+                        f"INSERT INTO {self.TABLE_DATA_POINTS} (chart_id, date, sys_col, value) VALUES (?, ?, ?, ?)",
+                        data_backup
+                    )
+
+                if metadata_backup:
+                    # Map old columns to new schema
+                    for row in metadata_backup:
+                        old_data = dict(zip(metadata_cols, row))
                         self.cursor.execute(
-                            f"UPDATE {table_name} SET {col_name} = ? WHERE {col_name} IS NULL OR {col_name} = ''",
-                            (default_value,)
+                            f"INSERT INTO {self.TABLE_CHART_METADATA} (chart_id, metadata, thumbnail, metadata_hash, last_modified, owner, accepting_changes) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            (
+                                old_data.get('chart_id'),
+                                old_data.get('metadata'),
+                                old_data.get('thumbnail'),
+                                old_data.get('metadata_hash'),
+                                old_data.get('last_modified', 0),
+                                old_data.get('owner'),
+                                old_data.get('accepting_changes', 0)
+                            )
                         )
 
-        # Handle deprecated columns
-        self._remove_deprecated_columns()
-        self.connection.commit()
-        
-        # Count charts after schema updates
-        try:
-            self.cursor.execute(f"SELECT COUNT(*) FROM {self.TABLE_CHART_METADATA}")
-            charts_after = self.cursor.fetchone()[0]
-            debug_print(f"_ensure_new_columns() - charts after schema update: {charts_after}")
-            
-            if charts_after != charts_before:
-                debug_print(f"_ensure_new_columns() - WARNING: Chart count changed from {charts_before} to {charts_after}")
-                # Log remaining chart IDs if any were lost
-                self.cursor.execute(f"SELECT chart_id FROM {self.TABLE_CHART_METADATA}")
-                remaining_chart_ids = [row[0] for row in self.cursor.fetchall()]
-                debug_print(f"_ensure_new_columns() - remaining chart IDs: {remaining_chart_ids}")
+                self.connection.commit()
+                debug_print(f"_migrate_schema() - migration complete, restored {len(data_backup)} data points")
         except sqlite3.Error as e:
-            debug_print(f"_ensure_new_columns() - error counting charts after update: {e}")
+            debug_print(f"_migrate_schema() - error: {e}")
 
     def _get_current_table_columns(self, table_name):
         """Get current columns in a table."""
@@ -612,12 +611,14 @@ class ChartRepository:
 
     def save_complete_chart(self):
         """Save complete chart (data + metadata) to database."""
-        debug_print('save complete chart ran')
-        chart_id = self.data_manager.chart_data['chart_file_path']
 
         # Validation: Reject save if chart_id is null/empty
+        chart_id = self.data_manager.chart_data['chart_file_path']
         if not chart_id or (isinstance(chart_id, str) and not chart_id.strip()):
             debug_print('save_complete_chart - ERROR: chart_id is null or empty, rejecting save')
+            return False
+        else:
+            debug_print('save complete chart ran')
 
         df_data = self.data_manager.df_raw.copy()
         chart_data = copy.deepcopy(self.data_manager.chart_data)
@@ -639,7 +640,7 @@ class ChartRepository:
             data_rows = self._prepare_data_points(chart_id, df_data)
             for row in data_rows:
                 operations.append({
-                    'query': f"INSERT OR REPLACE INTO {self.db.TABLE_DATA_POINTS} (chart_id, date, sys_col, value) VALUES (?, ?, ?, ?)",
+                    'query': f"INSERT INTO {self.db.TABLE_DATA_POINTS} (chart_id, date, sys_col, value) VALUES (?, ?, ?, ?)",
                     'params': row
                 })
 
@@ -692,10 +693,10 @@ class ChartRepository:
             )
             available_chart_ids = [row[0] for row in all_charts] if all_charts else []
             debug_print(f"load_chart_data() - available charts in database: {available_chart_ids}")
-        
-        # Load data points
+
+        # Load data points including id
         results = self.db.execute_with_retry(
-            f"SELECT date, sys_col, value FROM {self.db.TABLE_DATA_POINTS} WHERE chart_id = ?",
+            f"SELECT id, date, sys_col, value FROM {self.db.TABLE_DATA_POINTS} WHERE chart_id = ?",  # Added 'id'
             (chart_id,),
             fetch='all'
         )
@@ -709,7 +710,7 @@ class ChartRepository:
             return pd.DataFrame()
 
         debug_print(f"load_chart_data() - found {len(results)} data points for chart \"{chart_id}\"")
-        return self._build_dataframe_from_results(results)
+        return self._build_dataframe_from_series_table(results)
 
     def delete_chart(self, chart_id):
         """Delete chart data and metadata from database."""
@@ -1276,33 +1277,61 @@ class ChartRepository:
         }
 
     def _prepare_data_points(self, chart_id, df_data):
-        """Prepare data points for database insertion"""
+        # Transform DataFrame from wide format to long format for database storage.
+        # Converts DataFrame rows (one per date with multiple value columns) into individual database rows (one per date-column-value).
+
         rows = []
         for _, row in df_data.iterrows():
             date = row['d'].strftime('%Y-%m-%d') if hasattr(row['d'], 'strftime') else str(row['d'])
 
             for col in row.index:
-                if col != 'd' and not pd.isna(row[col]):
-                    rows.append((chart_id, date, col, float(row[col])))
+                if col == 'd':  # Skip the date column itself
+                    continue
+
+                value = row[col]
+                # Convert NaN to None, non-NaN to float (if not already None)
+                processed_value = None if pd.isna(value) else float(value)
+                rows.append((chart_id, date, col, processed_value))
 
         return rows
 
-    def _build_dataframe_from_results(self, results):
-        """Build DataFrame from database query results."""
-        dates = sorted(set(row[0] for row in results))
-        columns = set(row[1] for row in results)
+    def _build_dataframe_from_series_table(self, results):
+        if not results:
+            return pd.DataFrame()
 
-        data_dict = {'d': dates}
-        for col in columns:
-            data_dict[col] = [None] * len(dates)
+        # Determine the columns
+        sys_col_idx = 2
+        all_sys_cols = []
+        for r in results:
+            sys_col = r[sys_col_idx]
+            if sys_col not in all_sys_cols:
+                all_sys_cols.append(sys_col)
+            else:
+                break
 
-        date_to_index = {date: idx for idx, date in enumerate(dates)}
-        for date, col, value in results:
-            data_dict[col][date_to_index[date]] = value
+        n_cols = len(all_sys_cols)
+        rows = []
 
-        df = pd.DataFrame(data_dict)
-        df['d'] = pd.to_datetime(df['d'])
+        # Iterate results in chunks of size n_cols
+        for i in range(0, len(results), n_cols):
+            chunk = results[i:i + n_cols]
+            if len(chunk) != n_cols:
+                # handle incomplete row if needed
+                continue
+
+            row = {"d": chunk[0][1]}  # date is in index 1
+            for r in chunk:
+                col = r[2]
+                val = r[3]
+                row[col] = val
+            rows.append(row)
+
+        df = pd.DataFrame(rows)
+        df["d"] = pd.to_datetime(df["d"])
+        df = df.reset_index(drop=True)
+
         return df
+
 
     def _load_chart_metadata(self, chart_id):
         """Load chart metadata from database."""
@@ -1902,7 +1931,7 @@ class SyncManager:
 
         # Insert data points
         if data_points:
-            to_cursor.executemany(f"INSERT OR REPLACE INTO {self.db.TABLE_DATA_POINTS} VALUES (?, ?, ?, ?)",
+            to_cursor.executemany(f"INSERT INTO {self.db.TABLE_DATA_POINTS} (chart_id, date, sys_col, value) VALUES (?, ?, ?, ?)",
                                   [(chart_id, date, sys_col, value) for date, sys_col, value in data_points])
 
         to_cursor.connection.commit()
