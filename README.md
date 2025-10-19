@@ -1,6 +1,6 @@
 # OpenCelerator
 
-OpenCelerator is an open-source Python implementation of the Standard Celeration Chart (SCC). The SCC is a versatile data visualization tool used in the field of Precision Teaching and other areas for analysis of frequencies. The project is currently in alpha. If something is not working, let me know! The goal is a free and easy to use app for charting on desktop. Will add an instruction manual in the near future.
+OpenCelerator is an open-source Python implementation of the Standard Celeration Chart (SCC). The SCC is a versatile data visualization tool used in the field of Precision Teaching and other areas for analysis of frequencies. The project is currently in alpha. If something is not working, let me know! The goal is a free and easy to use app for charting on desktop.
 
 Tutorial: [Playlist](https://youtube.com/playlist?list=PLAU5et__-B6HBLmOlM8rKF37CFpr_jDhN&feature=shared) (New!) <br>
 About me: [LinkedIn](https://www.linkedin.com/in/jsv01/)<br>
